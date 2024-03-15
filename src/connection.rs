@@ -1,6 +1,8 @@
 use crate::error::{ErrorCode, LocalLogicErrorSubcode, Result};
 use crate::message::{Message, OpenMsg};
 use bytes::{Buf, BytesMut};
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
@@ -39,19 +41,6 @@ impl BgpConn {
                 }
             };
             return Ok(frame);
-
-            // if len == 0 {
-            //     while let frame = Message::decode(&mut self.buffer, self.peer.as_ref())? {
-            //         yield frame
-            //     }
-            // }
-
-            // while let frame = Message::decode(&mut self.buffer, self.peer.as_ref())? {
-            //     if let Message::Open(open) = frame {
-            //         self.peer = Some(open);
-            //     }
-            //     yield frame;
-            // }
         }
     }
 }
