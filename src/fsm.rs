@@ -1,4 +1,6 @@
 use crate::connection::BgpConn;
+use crate::error::Error;
+use crate::message::*;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -8,6 +10,8 @@ use tokio::task;
 
 // Inspired from Tokio, roughly 30 years.
 pub const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 30);
+
+pub const DFLT_KEEPALIVE_FACTOR: u32 = 3;
 
 // Copied from FRR
 pub const DFLT_BGP_TIMERS_CONNECT: Duration = Duration::from_secs(10);
@@ -29,17 +33,17 @@ pub enum Event {
     KeepaliveTimerExpires {},
     DelayOpenTimerExpires {},
     IdleHoldTimerExpires {},
-    TcpConnectionValid {},
+    TcpConnectionValid { conn: TcpStream },
     TcpCRInvalid {},
     TcpCRAcked { conn: TcpStream },
     TcpConnectionConfirmed { conn: TcpStream },
     TcpConnectionFails {},
-    BGPOpen {},
-    BGPOpenWithDelayOpenTimerRunning {},
-    BGPHeaderErr {},
-    BGPOpenMsgErr {},
+    BGPOpen { msg: OpenMsg },
+    BGPOpenWithDelayOpenTimerRunning { msg: OpenMsg },
+    BGPHeaderErr { err: Error },
+    BGPOpenMsgErr { err: Error },
     BGPOpenCollisionDump {},
-    NotifyMsgVerErr {},
+    NotifyMsgVerErr { err: Error },
     NotifyMsgErr {},
     KeepaliveMsg {},
     UpdateMsg {},
@@ -53,6 +57,14 @@ pub struct SessionAttributes {
     pub keepalive_time: Duration,
     pub delay_open_time: Duration,
     pub delay_open: bool,
+    pub send_notification_without_open: bool,
+    pub damp_peer_oscillations: bool,
+
+    //TODO: Current timer_loop implementation does not support querying the timer for remaining time.
+    pub cur_connect_retry_time: Duration,
+    pub cur_hold_time: Duration,
+    pub cur_keepalive_time: Duration,
+    pub cur_delay_open_time: Duration,
 }
 
 impl SessionAttributes {
@@ -64,6 +76,13 @@ impl SessionAttributes {
             keepalive_time: DFLT_BGP_KEEPALIVE,
             delay_open_time: Duration::ZERO,
             delay_open: false,
+            send_notification_without_open: false,
+            damp_peer_oscillations: false,
+
+            cur_connect_retry_time: FAR_FUTURE,
+            cur_hold_time: FAR_FUTURE,
+            cur_keepalive_time: FAR_FUTURE,
+            cur_delay_open_time: FAR_FUTURE,
         }
     }
 }
@@ -78,17 +97,29 @@ pub struct Idle {}
 
 pub struct Connect {
     pub tcp_conn_handle: Option<task::JoinHandle<()>>,
-    pub tcp_conn: Option<TcpStream>,
+    // pub tcp_conn: Option<TcpStream>,
+    pub bgp_conn_handle: Option<task::JoinHandle<()>>,
+    pub bgp_out_tx: Option<mpsc::Sender<Message>>,
 }
 
-pub struct Active {}
+pub struct Active {
+    pub tcp_conn_handle: Option<task::JoinHandle<()>>,
+    pub bgp_conn_handle: Option<task::JoinHandle<()>>,
+    pub bgp_out_tx: Option<mpsc::Sender<Message>>,
+}
 
 pub struct OpenSent {
     pub bgp_conn_handle: Option<task::JoinHandle<()>>,
-    pub bgp_conn: Option<BgpConn>,
+    pub bgp_out_tx: Option<mpsc::Sender<Message>>,
+    pub local_open: Option<OpenMsg>,
 }
 
-pub struct OpenConfirm {}
+pub struct OpenConfirm {
+    pub bgp_conn_handle: Option<task::JoinHandle<()>>,
+    pub bgp_out_tx: Option<mpsc::Sender<Message>>,
+    pub peer_open: Option<OpenMsg>,
+    pub local_open: Option<OpenMsg>,
+}
 
 pub struct Established {}
 
@@ -107,7 +138,9 @@ impl From<Fsm<Idle>> for Fsm<Connect> {
         Fsm {
             state: Connect {
                 tcp_conn_handle: None,
-                tcp_conn: None,
+                // tcp_conn: None,
+                bgp_conn_handle: None,
+                bgp_out_tx: None,
             },
             peer: fsm.peer,
             attr: fsm.attr,
@@ -118,7 +151,11 @@ impl From<Fsm<Idle>> for Fsm<Connect> {
 impl From<Fsm<Idle>> for Fsm<Active> {
     fn from(fsm: Fsm<Idle>) -> Fsm<Active> {
         Fsm {
-            state: Active {},
+            state: Active {
+                tcp_conn_handle: None,
+                bgp_conn_handle: None,
+                bgp_out_tx: None,
+            },
             peer: fsm.peer,
             attr: fsm.attr,
         }
@@ -127,6 +164,12 @@ impl From<Fsm<Idle>> for Fsm<Active> {
 
 impl From<Fsm<Connect>> for Fsm<Idle> {
     fn from(fsm: Fsm<Connect>) -> Fsm<Idle> {
+        if let Some(tcp_conn_handle) = fsm.state.tcp_conn_handle {
+            tcp_conn_handle.abort();
+        }
+        if let Some(bgp_conn_handle) = fsm.state.bgp_conn_handle {
+            bgp_conn_handle.abort();
+        }
         Fsm {
             state: Idle {},
             peer: fsm.peer,
@@ -137,8 +180,15 @@ impl From<Fsm<Connect>> for Fsm<Idle> {
 
 impl From<Fsm<Connect>> for Fsm<Active> {
     fn from(fsm: Fsm<Connect>) -> Fsm<Active> {
+        if let Some(tcp_conn_handle) = fsm.state.tcp_conn_handle {
+            tcp_conn_handle.abort();
+        }
         Fsm {
-            state: Active {},
+            state: Active {
+                tcp_conn_handle: None,
+                bgp_conn_handle: fsm.state.bgp_conn_handle,
+                bgp_out_tx: fsm.state.bgp_out_tx,
+            },
             peer: fsm.peer,
             attr: fsm.attr,
         }
@@ -150,7 +200,124 @@ impl From<Fsm<Connect>> for Fsm<OpenSent> {
         Fsm {
             state: OpenSent {
                 bgp_conn_handle: None,
-                bgp_conn: None,
+                bgp_out_tx: None,
+                local_open: None,
+            },
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<Connect>> for Fsm<OpenConfirm> {
+    fn from(fsm: Fsm<Connect>) -> Fsm<OpenConfirm> {
+        Fsm {
+            state: OpenConfirm {
+                bgp_conn_handle: fsm.state.bgp_conn_handle,
+                bgp_out_tx: fsm.state.bgp_out_tx,
+                peer_open: None,
+                local_open: None,
+            },
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<Active>> for Fsm<Idle> {
+    fn from(fsm: Fsm<Active>) -> Fsm<Idle> {
+        if let Some(bgp_conn_handle) = fsm.state.bgp_conn_handle {
+            bgp_conn_handle.abort();
+        }
+        Fsm {
+            state: Idle {},
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<Active>> for Fsm<Connect> {
+    fn from(fsm: Fsm<Active>) -> Fsm<Connect> {
+        Fsm {
+            state: Connect {
+                tcp_conn_handle: fsm.state.tcp_conn_handle,
+                bgp_conn_handle: fsm.state.bgp_conn_handle,
+                bgp_out_tx: fsm.state.bgp_out_tx,
+            },
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<Active>> for Fsm<OpenSent> {
+    fn from(fsm: Fsm<Active>) -> Fsm<OpenSent> {
+        Fsm {
+            state: OpenSent {
+                bgp_conn_handle: fsm.state.bgp_conn_handle,
+                bgp_out_tx: fsm.state.bgp_out_tx,
+                local_open: None,
+            },
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<Active>> for Fsm<OpenConfirm> {
+    fn from(fsm: Fsm<Active>) -> Fsm<OpenConfirm> {
+        Fsm {
+            state: OpenConfirm {
+                bgp_conn_handle: fsm.state.bgp_conn_handle,
+                bgp_out_tx: fsm.state.bgp_out_tx,
+                peer_open: None,
+                local_open: None,
+            },
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<OpenSent>> for Fsm<Idle> {
+    fn from(fsm: Fsm<OpenSent>) -> Fsm<Idle> {
+        if let Some(bgp_conn_handle) = fsm.state.bgp_conn_handle {
+            bgp_conn_handle.abort();
+        }
+        Fsm {
+            state: Idle {},
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<OpenSent>> for Fsm<Active> {
+    fn from(fsm: Fsm<OpenSent>) -> Fsm<Active> {
+        if let Some(bgp_conn_handle) = fsm.state.bgp_conn_handle {
+            bgp_conn_handle.abort();
+        }
+        Fsm {
+            state: Active {
+                tcp_conn_handle: None,
+                bgp_conn_handle: None,
+                bgp_out_tx: None,
+            },
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<OpenSent>> for Fsm<OpenConfirm> {
+    fn from(fsm: Fsm<OpenSent>) -> Fsm<OpenConfirm> {
+        Fsm {
+            state: OpenConfirm {
+                bgp_conn_handle: fsm.state.bgp_conn_handle,
+                bgp_out_tx: fsm.state.bgp_out_tx,
+                peer_open: None,
+                local_open: fsm.state.local_open,
             },
             peer: fsm.peer,
             attr: fsm.attr,
@@ -175,7 +342,7 @@ impl State {
 
 pub enum Operation {
     Stop,
-    Reset,
+    Restart,
     Update { duration: Duration },
 }
 
@@ -219,30 +386,3 @@ pub enum Timer {
     DelayOpen { op: Operation },
     IdleHold { op: Operation },
 }
-
-// #[derive(Debug)]
-// pub enum State {
-//     Idle { peer: IpAddr },
-//     Connect { tcp_conn: TcpStream },
-//     Active {},
-//     OpenSent {},
-//     OpenConfirm {},
-//     Established {},
-// }
-
-// impl State {
-//     pub fn new(peer: IpAddr) -> State {
-//         State::Idle { peer }
-//     }
-//     pub fn next(self, event: Event) -> State {
-//         match (self, event) {
-//             (State::Idle { peer }, Event::ManualStart {})
-//             | (State::Idle { peer }, Event::AutomaticStart {}) => {
-//                 let addr_port = SocketAddr::new(peer, 179);
-//                 let conn = TcpStream::connect(addr_port);
-//                 State::Connect { tcp_conn: conn }
-//             }
-//             (s, e) => s,
-//         }
-//     }
-// }

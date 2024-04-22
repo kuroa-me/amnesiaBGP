@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 bytes = "1.5.0"
+foundations = "3.3.0"
 ipnet = "2.9.0"
 octets = "0.3.0"
 parking_lot = "0.12.1"

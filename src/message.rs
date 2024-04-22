@@ -1,6 +1,9 @@
-use crate::error::{
-    BError, Error, LocalLogicErrorSubcode, MsgHeaderErrorSubcode, OpenMsgErrorSubcode, Result,
-    UpdateMsgErrorSubcode,
+use crate::{
+    config,
+    error::{
+        Error, ErrorCode, ErrorSubCode, LocalLogicErrorSubcode, MsgHeaderErrorSubcode,
+        OpenMsgErrorSubcode, Result, UpdateMsgErrorSubcode,
+    },
 };
 use bytes::{Buf, BytesMut};
 use octets::Octets;
@@ -232,9 +235,9 @@ impl OptParams {
 #[derive(Debug, Clone)]
 pub struct OpenMsg {
     pub version: u8,
-    pub as_number: u16,
+    pub as_number: u32,
     pub hold_time: u16,
-    pub bgp_identifier: u32, // bgp router-id, //TODO: Check if it is the same as the BGP Identifier of the local BGP speaker and the message is from an internal peer
+    pub bgp_identifier: Ipv4Addr, // bgp router-id, //TODO: Check if it is the same as the BGP Identifier of the local BGP speaker and the message is from an internal peer
     pub ext_opt_param: bool,
     pub opt_params_len: u16,
     pub opt_params: OptParams,
@@ -248,7 +251,7 @@ impl OpenMsg {
         }
         buf.skip(3)?; //Skip padding
 
-        let as_number = buf.get_u16()?;
+        let as_number = buf.get_u16()? as u32;
         buf.skip(2)?; //Skip padding
 
         //TODO: Implement "unacceptable" AS number check
@@ -261,9 +264,11 @@ impl OpenMsg {
 
         let bgp_identifier = buf.get_u32()?;
         // RFC 4271: The value of BGP Identifier field must not be all zeros or all ones.
-        if bgp_identifier == 0 {
+        if bgp_identifier == 0 || bgp_identifier == u32::MAX {
             return Error::err_open(OpenMsgErrorSubcode::BadBgpIdentifier, None);
         }
+        // Convert the BGP Identifier to an IP address
+        let bgp_identifier = Ipv4Addr::from(bgp_identifier.to_be_bytes());
 
         let non_ext_op_len = buf.get_u8()?;
         let non_ext_op_type = buf.get_u8()?;
@@ -293,6 +298,22 @@ impl OpenMsg {
             opt_params_len,
             opt_params,
         })
+    }
+
+    pub fn from_conf(conf: &config::Neighbor) -> OpenMsg {
+        OpenMsg {
+            version: 4,
+            as_number: conf.config.local_as,
+            hold_time: conf.timers.config.hold_time,
+            bgp_identifier: conf.config.router_id,
+            //TODO: Implement optional parameters
+            ext_opt_param: false,
+            opt_params_len: 0,
+            opt_params: OptParams {
+                mp_ext_caps: None,
+                four_octet_as_cap: None,
+            },
+        }
     }
 }
 
@@ -616,6 +637,10 @@ impl KeepaliveMsg {
     pub fn decode(buf: &mut Octets<'_>) -> Result<KeepaliveMsg> {
         Ok(KeepaliveMsg {})
     }
+
+    pub fn new() -> KeepaliveMsg {
+        KeepaliveMsg {}
+    }
 }
 
 /*
@@ -640,6 +665,26 @@ impl NotificationMsg {
             error_subcode: buf.get_u8()?,
             data: Some(buf.get_bytes(buf.cap())?.to_vec()),
         })
+    }
+
+    pub fn from_enum(
+        code: ErrorCode,
+        subcode: ErrorSubCode,
+        data: Option<Vec<u8>>,
+    ) -> NotificationMsg {
+        NotificationMsg {
+            error_code: code as u8,
+            error_subcode: subcode.into(),
+            data,
+        }
+    }
+
+    pub fn from_error(err: Error) -> NotificationMsg {
+        NotificationMsg {
+            error_code: err.code as u8,
+            error_subcode: err.subcode.into(),
+            data: err.data,
+        }
     }
 }
 
@@ -682,5 +727,34 @@ impl Message {
         };
         buf.advance(oct.off() + MIN_MSG_LEN);
         res
+    }
+
+    pub fn encode(msg: Message) -> Result<BytesMut> {
+        let mut buf = BytesMut::with_capacity(4096);
+        Ok(buf)
+    }
+}
+
+impl From<OpenMsg> for Message {
+    fn from(msg: OpenMsg) -> Message {
+        Message::Open(msg)
+    }
+}
+
+impl From<UpdateMsg> for Message {
+    fn from(msg: UpdateMsg) -> Message {
+        Message::Update(msg)
+    }
+}
+
+impl From<KeepaliveMsg> for Message {
+    fn from(msg: KeepaliveMsg) -> Message {
+        Message::Keepalive(msg)
+    }
+}
+
+impl From<NotificationMsg> for Message {
+    fn from(msg: NotificationMsg) -> Message {
+        Message::Notification(msg)
     }
 }

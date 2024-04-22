@@ -1,88 +1,56 @@
-use core::any::Any;
-
-use crate::message::NotificationMsg;
-
-pub type BError = Box<Error>;
-pub type Result<T> = std::result::Result<T, BError>;
+// pub type Error = Box<Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub struct Error {
     pub code: ErrorCode,
     pub subcode: ErrorSubCode,
-    pub data: Option<Box<(dyn Any + Send + Sync)>>,
+    pub data: Option<Vec<u8>>,
 }
 
 impl Error {
-    pub fn new(
-        code: ErrorCode,
-        subcode: ErrorSubCode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> BError {
-        Box::new(Error {
+    pub fn new(code: ErrorCode, subcode: ErrorSubCode, data: Option<Vec<u8>>) -> Error {
+        Error {
             code,
             subcode,
             data,
-        })
+        }
     }
 
-    pub fn new_local(
-        subcode: LocalLogicErrorSubcode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> BError {
+    pub fn new_local(subcode: LocalLogicErrorSubcode, data: Option<Vec<u8>>) -> Error {
         Error::new(ErrorCode::LocalLogicError, subcode.into(), data)
     }
 
-    pub fn new_header(
-        subcode: MsgHeaderErrorSubcode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> BError {
+    pub fn new_header(subcode: MsgHeaderErrorSubcode, data: Option<Vec<u8>>) -> Error {
         Error::new(ErrorCode::MessageHeaderError, subcode.into(), data)
     }
 
-    pub fn new_open(
-        subcode: OpenMsgErrorSubcode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> BError {
+    pub fn new_open(subcode: OpenMsgErrorSubcode, data: Option<Vec<u8>>) -> Error {
         Error::new(ErrorCode::OpenMessageError, subcode.into(), data)
     }
 
-    pub fn new_update(
-        subcode: UpdateMsgErrorSubcode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> BError {
+    pub fn new_update(subcode: UpdateMsgErrorSubcode, data: Option<Vec<u8>>) -> Error {
         Error::new(ErrorCode::UpdateMessageError, subcode.into(), data)
     }
 
-    pub fn err_local<T>(
-        subcode: LocalLogicErrorSubcode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> Result<T> {
+    pub fn err_local<T>(subcode: LocalLogicErrorSubcode, data: Option<Vec<u8>>) -> Result<T> {
         Err(Self::new_local(subcode, data))
     }
 
-    pub fn err_header<T>(
-        subcode: MsgHeaderErrorSubcode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> Result<T> {
+    pub fn err_header<T>(subcode: MsgHeaderErrorSubcode, data: Option<Vec<u8>>) -> Result<T> {
         Err(Self::new_header(subcode, data))
     }
 
-    pub fn err_open<T>(
-        subcode: OpenMsgErrorSubcode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> Result<T> {
+    pub fn err_open<T>(subcode: OpenMsgErrorSubcode, data: Option<Vec<u8>>) -> Result<T> {
         Err(Self::new_open(subcode, data))
     }
 
-    pub fn err_update<T>(
-        subcode: UpdateMsgErrorSubcode,
-        data: Option<Box<(dyn Any + Send + Sync)>>,
-    ) -> Result<T> {
+    pub fn err_update<T>(subcode: UpdateMsgErrorSubcode, data: Option<Vec<u8>>) -> Result<T> {
         Err(Self::new_update(subcode, data))
     }
 }
 
-impl From<octets::BufferTooShortError> for BError {
+impl From<octets::BufferTooShortError> for Error {
     fn from(_: octets::BufferTooShortError) -> Self {
         Error::new(
             ErrorCode::LocalLogicError,
@@ -92,34 +60,13 @@ impl From<octets::BufferTooShortError> for BError {
     }
 }
 
-impl From<std::io::Error> for BError {
+impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::new(
             ErrorCode::LocalLogicError,
             LocalLogicErrorSubcode::IOError.into(),
             None,
         )
-    }
-}
-
-impl TryInto<NotificationMsg> for BError {
-    //TODO: This self wrapping might not be correct.
-    type Error = Self;
-
-    fn try_into(self) -> std::result::Result<NotificationMsg, Self::Error> {
-        if self.code == ErrorCode::LocalLogicError {
-            return Err(self);
-        }
-        Ok(NotificationMsg {
-            error_code: self.code as u8,
-            error_subcode: match self.subcode {
-                ErrorSubCode::MsgHeaderErrorSubcode(subcode) => subcode as u8,
-                ErrorSubCode::OpenMsgErrorSubcode(subcode) => subcode as u8,
-                ErrorSubCode::UpdateMsgErrorSubcode(subcode) => subcode as u8,
-                _ => 0,
-            },
-            data: None, //TODO: Implement encode
-        })
     }
 }
 
@@ -168,6 +115,19 @@ pub enum ErrorSubCode {
     MsgHeaderErrorSubcode(MsgHeaderErrorSubcode),
     OpenMsgErrorSubcode(OpenMsgErrorSubcode),
     UpdateMsgErrorSubcode(UpdateMsgErrorSubcode),
+    Undefined,
+}
+
+impl From<ErrorSubCode> for u8 {
+    fn from(subcode: ErrorSubCode) -> Self {
+        match subcode {
+            ErrorSubCode::LocalLogicErrorSubcode(subcode) => subcode as u8,
+            ErrorSubCode::MsgHeaderErrorSubcode(subcode) => subcode as u8,
+            ErrorSubCode::OpenMsgErrorSubcode(subcode) => subcode as u8,
+            ErrorSubCode::UpdateMsgErrorSubcode(subcode) => subcode as u8,
+            ErrorSubCode::Undefined => 0,
+        }
+    }
 }
 
 impl From<LocalLogicErrorSubcode> for ErrorSubCode {

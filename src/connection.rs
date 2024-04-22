@@ -3,6 +3,8 @@ use crate::message::{Message, OpenMsg};
 use bytes::{Buf, BytesMut};
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
@@ -19,6 +21,10 @@ impl BgpConn {
             buffer: BytesMut::with_capacity(4096), // Longest BGP message is 4096 octets.
             peer: None,
         }
+    }
+
+    pub fn peer_sock(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
     }
 
     pub async fn read_message(&mut self) -> Result<Message> {
@@ -42,5 +48,13 @@ impl BgpConn {
             };
             return Ok(frame);
         }
+    }
+
+    pub async fn write_message(&mut self, msg: Message) -> Result<()> {
+        let mut buf = match Message::encode(msg) {
+            Ok(buf) => buf,
+            Err(e) => return Err(e),
+        };
+        Ok(())
     }
 }
