@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
+#[derive(Debug)]
 pub struct BgpConn {
     stream: TcpStream,
     buffer: BytesMut,

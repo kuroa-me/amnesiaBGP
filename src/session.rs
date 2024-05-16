@@ -3,6 +3,7 @@ use crate::connection::BgpConn;
 use crate::error;
 use crate::fsm::*;
 use crate::message::*;
+use core::panic;
 use core::time::Duration;
 use foundations::telemetry::{init_with_server, log, tracing, TelemetryContext};
 use std::cmp::min;
@@ -15,7 +16,7 @@ use tokio::time::timeout;
 
 //TODO: Get rid of those 32 buffer sizes. Use more appropriate values
 
-fn timer_loop() -> (mpsc::Receiver<Event>, mpsc::Sender<Timer>) {
+fn timer_loop() -> (mpsc::Sender<Timer>, mpsc::Receiver<Event>) {
     let (timer_tx, timer_rx) = mpsc::channel::<Event>(32);
     let (timer_ctr_tx, mut timer_ctr_rx) = mpsc::channel::<Timer>(32);
 
@@ -73,7 +74,7 @@ fn timer_loop() -> (mpsc::Receiver<Event>, mpsc::Sender<Timer>) {
         }
     });
 
-    (timer_rx, timer_ctr_tx)
+    (timer_ctr_tx, timer_rx)
 }
 
 pub async fn try_tcp_conn(tcp_tx: mpsc::Sender<Event>, peer: SocketAddr) {
@@ -88,21 +89,55 @@ pub async fn try_tcp_conn(tcp_tx: mpsc::Sender<Event>, peer: SocketAddr) {
     }
 }
 
+pub enum Source {
+    Admin,
+    Tcp,
+    Bgp,
+    Coll,
+    Timer,
+}
+
 pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: config::Neighbor) {
     let (tcp_tx, mut tcp_rx) = mpsc::channel::<Event>(32);
     let (bgp_tx, mut bgp_rx) = mpsc::channel::<Event>(32);
-    let (mut timer_rx, timer_ctr_tx) = timer_loop();
+    let (coll_tx, mut coll_rx) = mpsc::channel::<Event>(32);
+    let (timer_ctr_tx, mut timer_rx) = timer_loop();
     loop {
+        let mut source = Source::Admin;
         let event = select! {
-            event = admin_rx.recv() => event.unwrap(),
-            event = tcp_rx.recv() => event.unwrap(),
-            event = bgp_rx.recv() => event.unwrap(),
-            event = timer_rx.recv() => event.unwrap(),
+            event = admin_rx.recv() => {
+                source = Source::Admin;
+                match event.unwrap() {
+                // Admin channel is also utilized for passing passively established
+                // BGP connections. But before passing in, the FSM attributes are
+                // unknown. Thus, we need to modify the event to fit the FSM.
+                Event::BGPOpen { msg, remote_syn } if session.get_attr().cur_delay_open_time != FAR_FUTURE => {
+                    Event::BGPOpenWithDelayOpenTimerRunning { msg, remote_syn }
+                },
+                e @ _ => e,
+            }},
+            event = tcp_rx.recv() => {
+                source = Source::Tcp;
+                event.unwrap()
+            },
+            event = bgp_rx.recv() => {
+                source = Source::Bgp;
+                event.unwrap()
+            },
+            event = coll_rx.recv() => {
+                source = Source::Coll;
+                event.unwrap()
+            },
+            event = timer_rx.recv() => {
+                source = Source::Timer;
+                event.unwrap()
+            },
         };
-        match (session, event) {
+        match (session, event, source) {
             // Idle State:
-            (State::Idle(s), Event::ManualStart {})
-            | (State::Idle(s), Event::AutomaticStart {}) => {
+            //[Page 53]
+            (State::Idle(s), Event::ManualStart {}, _)
+            | (State::Idle(s), Event::AutomaticStart {}, _) => {
                 let mut fsm: Fsm<Connect> = s.into();
 
                 fsm.attr.connect_retry_counter = 0;
@@ -123,8 +158,9 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Connect(fsm);
             }
 
-            (State::Idle(s), Event::ManualStartWithPassiveTcpEstablishment {})
-            | (State::Idle(s), Event::AutomaticStartWithPassiveTcpEstablishment {}) => {
+            //[Page 54]
+            (State::Idle(s), Event::ManualStartWithPassiveTcpEstablishment {}, _)
+            | (State::Idle(s), Event::AutomaticStartWithPassiveTcpEstablishment {}, _) => {
                 let mut fsm: Fsm<Active> = s.into();
 
                 fsm.attr.connect_retry_counter = 0;
@@ -142,7 +178,8 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             // Connect State:
-            (State::Connect(s), Event::ManualStop {}) => {
+            //[Page 54]
+            (State::Connect(s), Event::ManualStop {}, _) => {
                 // Old connection is dropped in the into() function
                 let mut fsm: Fsm<Idle> = s.into();
 
@@ -158,7 +195,8 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Idle(fsm);
             }
 
-            (State::Connect(mut s), Event::ConnectRetryTimerExpires {}) => {
+            //[Page 55]
+            (State::Connect(mut s), Event::ConnectRetryTimerExpires {}, _) => {
                 // Drop the old connection
                 if let Some(handle) = s.state.tcp_conn_handle.take() {
                     handle.abort();
@@ -186,7 +224,8 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Connect(s);
             }
 
-            (State::Connect(s), Event::DelayOpenTimerExpires {}) => {
+            //[Page 55]
+            (State::Connect(s), Event::DelayOpenTimerExpires {}, _) => {
                 // BGP connection is already created, just send the Open message
                 let mut fsm: Fsm<OpenSent> = s.into();
                 let bgp_out_tx = fsm.state.bgp_out_tx.as_ref().unwrap();
@@ -198,17 +237,21 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::OpenSent(fsm);
             }
 
+            //[Page 55]
             // Not Implemented
-            (State::Connect(s), Event::TcpConnectionValid { conn: _ }) => {
+            (State::Connect(s), Event::TcpConnectionValid {}, _) => {
                 session = State::Connect(s);
             }
 
-            (State::Connect(s), Event::TcpCRInvalid {}) => {
+            //[Page 55]
+            (State::Connect(s), Event::TcpCRInvalid {}, _) => {
                 session = State::Connect(s);
             }
 
-            (State::Connect(mut s), Event::TcpCRAcked { conn })
-            | (State::Connect(mut s), Event::TcpConnectionConfirmed { conn }) => {
+            //[Page 55]
+            (State::Connect(mut s), Event::TcpCRAcked { conn }, _) => {
+                let remote_syn = false;
+
                 s.attr.connect_retry_counter = 0;
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
@@ -222,7 +265,54 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 let bgp_tx = bgp_tx.clone();
                 let (bgp_out_tx, bgp_out_rx) = mpsc::channel::<Message>(32);
                 s.state.bgp_conn_handle = Some(tokio::spawn(async move {
-                    process(conn, bgp_tx, bgp_out_rx).await;
+                    let bgp_conn = BgpConn::new(conn);
+                    process(bgp_conn, bgp_tx, bgp_out_rx, remote_syn).await;
+                }));
+                s.state.bgp_out_tx = Some(bgp_out_tx.clone());
+
+                if s.attr.delay_open {
+                    timer_ctr_tx
+                        .send(Timer::DelayOpen {
+                            op: Operation::Update {
+                                duration: s.attr.delay_open_time,
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    s.attr.cur_delay_open_time = s.attr.delay_open_time;
+
+                    session = State::Connect(s);
+                    continue;
+                } else {
+                    bgp_out_tx
+                        .send(OpenMsg::from_conf(&conf).into())
+                        .await
+                        .unwrap();
+                    let mut fsm: Fsm<OpenSent> = s.into();
+                    fsm.state.remote_syn = remote_syn;
+                    //TODO: Sets the HoldTimer to a large value
+                    session = State::OpenSent(fsm);
+                }
+            }
+
+            //[Page 55]
+            (State::Connect(mut s), Event::TcpConnectionConfirmed { bgp_conn }, _) => {
+                let remote_syn = true;
+
+                s.attr.connect_retry_counter = 0;
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+
+                // Create BGP connection from TCP connection
+                let bgp_tx = bgp_tx.clone();
+                let (bgp_out_tx, bgp_out_rx) = mpsc::channel::<Message>(32);
+                s.state.bgp_conn_handle = Some(tokio::spawn(async move {
+                    process(bgp_conn, bgp_tx, bgp_out_rx, remote_syn).await;
                 }));
                 s.state.bgp_out_tx = Some(bgp_out_tx.clone());
 
@@ -243,13 +333,15 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                         .send(OpenMsg::from_conf(&conf).into())
                         .await
                         .unwrap();
-                    let fsm: Fsm<OpenSent> = s.into();
+                    let mut fsm: Fsm<OpenSent> = s.into();
+                    fsm.state.remote_syn = remote_syn;
                     //TODO: Sets the HoldTimer to a large value
                     session = State::OpenSent(fsm);
                 }
             }
 
-            (State::Connect(mut s), Event::TcpConnectionFails {}) => {
+            //[Page 56]
+            (State::Connect(mut s), Event::TcpConnectionFails {}, _) => {
                 match s.attr.cur_delay_open_time {
                     FAR_FUTURE => {
                         timer_ctr_tx
@@ -283,7 +375,12 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 }
             }
 
-            (State::Connect(mut s), Event::BGPOpenWithDelayOpenTimerRunning { msg }) => {
+            //[Page 56]
+            (
+                State::Connect(mut s),
+                Event::BGPOpenWithDelayOpenTimerRunning { msg, remote_syn },
+                _,
+            ) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Stop,
@@ -366,8 +463,9 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::OpenConfirm(fsm);
             }
 
-            (State::Connect(mut s), Event::BGPHeaderErr { err })
-            | (State::Connect(mut s), Event::BGPOpenMsgErr { err }) => {
+            //[Page 57]
+            (State::Connect(mut s), Event::BGPHeaderErr { err }, _)
+            | (State::Connect(mut s), Event::BGPOpenMsgErr { err }, _) => {
                 if s.attr.send_notification_without_open {
                     let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
                     bgp_out_tx
@@ -393,7 +491,8 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Idle(fsm);
             }
 
-            (State::Connect(mut s), Event::NotifyMsgVerErr { err }) => {
+            //[Page 57]
+            (State::Connect(mut s), Event::NotifyMsgVerErr { err }, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Stop,
@@ -422,7 +521,8 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Idle(fsm);
             }
 
-            (State::Connect(mut s), _) => {
+            //[Page 58]
+            (State::Connect(mut s), _, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Stop,
@@ -449,7 +549,23 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             // Active State:
-            (State::Active(mut s), Event::ManualStop {}) => {
+            //[Page 59]
+            // Ignore all start events (Events 1, 3-7)
+            (State::Active(s), Event::ManualStart {}, _)
+            | (State::Active(s), Event::AutomaticStart {}, _)
+            | (State::Active(s), Event::ManualStartWithPassiveTcpEstablishment {}, _)
+            | (State::Active(s), Event::AutomaticStartWithPassiveTcpEstablishment {}, _)
+            | (State::Active(s), Event::AutomaticStartWithDampPeerOscillations {}, _)
+            | (
+                State::Active(s),
+                Event::AutomaticStartWithDampPeerOscillationsAndPassiveTcpEstablishment {},
+                _,
+            ) => {
+                session = State::Active(s);
+            }
+
+            //[Page 59]
+            (State::Active(mut s), Event::ManualStop {}, _) => {
                 if s.attr.cur_hold_time != FAR_FUTURE {
                     timer_ctr_tx
                         .send(Timer::DelayOpen {
@@ -488,7 +604,8 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Idle(fsm);
             }
 
-            (State::Active(s), Event::ConnectRetryTimerExpires {}) => {
+            //[Page 59]
+            (State::Active(s), Event::ConnectRetryTimerExpires {}, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Restart,
@@ -506,8 +623,8 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Connect(fsm);
             }
 
-            //[Page 60]
-            (State::Active(mut s), Event::DelayOpenTimerExpires {}) => {
+            //[Page 59]
+            (State::Active(mut s), Event::DelayOpenTimerExpires {}, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Stop,
@@ -539,7 +656,110 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 60]
-            (State::Active(mut s), Event::TcpConnectionFails {}) => {
+            (State::Active(s), Event::TcpConnectionValid {}, _) => {
+                session = State::Active(s);
+            }
+
+            //[Page 60]
+            (State::Active(s), Event::TcpCRInvalid {}, _) => {
+                session = State::Active(s);
+            }
+
+            //[Page 60]
+            (State::Active(mut s), Event::TcpCRAcked { conn }, _) => {
+                let remote_syn = false;
+
+                s.attr.connect_retry_counter = 0;
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+
+                // Create BGP connection from TCP connection
+                let bgp_tx = bgp_tx.clone();
+                let (bgp_out_tx, bgp_out_rx) = mpsc::channel::<Message>(32);
+                s.state.bgp_conn_handle = Some(tokio::spawn(async move {
+                    let bgp_conn = BgpConn::new(conn);
+                    process(bgp_conn, bgp_tx, bgp_out_rx, remote_syn).await;
+                }));
+                s.state.bgp_out_tx = Some(bgp_out_tx.clone());
+
+                if s.attr.delay_open {
+                    timer_ctr_tx
+                        .send(Timer::DelayOpen {
+                            op: Operation::Update {
+                                duration: s.attr.delay_open_time,
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    s.attr.cur_delay_open_time = s.attr.delay_open_time;
+
+                    session = State::Active(s);
+                    continue;
+                } else {
+                    bgp_out_tx
+                        .send(OpenMsg::from_conf(&conf).into())
+                        .await
+                        .unwrap();
+                    let mut fsm: Fsm<OpenSent> = s.into();
+                    fsm.state.remote_syn = remote_syn;
+                    //TODO: Sets the HoldTimer to a large value
+                    session = State::OpenSent(fsm);
+                }
+            }
+
+            //[Page 60]
+            (State::Active(mut s), Event::TcpConnectionConfirmed { bgp_conn }, _) => {
+                let remote_syn = true;
+
+                s.attr.connect_retry_counter = 0;
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+
+                // Create BGP connection from TCP connection
+                let bgp_tx = bgp_tx.clone();
+                let (bgp_out_tx, bgp_out_rx) = mpsc::channel::<Message>(32);
+                s.state.bgp_conn_handle = Some(tokio::spawn(async move {
+                    process(bgp_conn, bgp_tx, bgp_out_rx, remote_syn).await;
+                }));
+                s.state.bgp_out_tx = Some(bgp_out_tx.clone());
+
+                if s.attr.delay_open {
+                    timer_ctr_tx
+                        .send(Timer::DelayOpen {
+                            op: Operation::Update {
+                                duration: s.attr.delay_open_time,
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    s.attr.cur_delay_open_time = s.attr.delay_open_time;
+
+                    session = State::Active(s);
+                    continue;
+                } else {
+                    bgp_out_tx
+                        .send(OpenMsg::from_conf(&conf).into())
+                        .await
+                        .unwrap();
+                    let mut fsm: Fsm<OpenSent> = s.into();
+                    fsm.state.remote_syn = remote_syn;
+                    //TODO: Sets the HoldTimer to a large value
+                    session = State::OpenSent(fsm);
+                }
+            }
+
+            //[Page 60]
+            (State::Active(mut s), Event::TcpConnectionFails {}, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Restart,
@@ -564,7 +784,11 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 61]
-            (State::Active(mut s), Event::BGPOpenWithDelayOpenTimerRunning { msg }) => {
+            (
+                State::Active(mut s),
+                Event::BGPOpenWithDelayOpenTimerRunning { msg, remote_syn },
+                _,
+            ) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Stop,
@@ -648,8 +872,8 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 62]
-            (State::Active(mut s), Event::BGPHeaderErr { err })
-            | (State::Active(mut s), Event::BGPOpenMsgErr { err }) => {
+            (State::Active(mut s), Event::BGPHeaderErr { err }, _)
+            | (State::Active(mut s), Event::BGPOpenMsgErr { err }, _) => {
                 if s.attr.send_notification_without_open {
                     let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
                     bgp_out_tx
@@ -676,7 +900,7 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 63]
-            (State::Active(mut s), Event::NotifyMsgVerErr { err }) => {
+            (State::Active(mut s), Event::NotifyMsgVerErr { err }, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Stop,
@@ -706,7 +930,7 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 63]
-            (State::Active(mut s), _) => {
+            (State::Active(mut s), _, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Stop,
@@ -725,22 +949,24 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Idle(fsm);
             }
 
+            // OpenSent State:
             //[Page 63]
             // Ignore all start events (Events 1, 3-7)
-            (State::OpenSent(s), Event::ManualStart {})
-            | (State::OpenSent(s), Event::AutomaticStart {})
-            | (State::OpenSent(s), Event::ManualStartWithPassiveTcpEstablishment {})
-            | (State::OpenSent(s), Event::AutomaticStartWithPassiveTcpEstablishment {})
-            | (State::OpenSent(s), Event::AutomaticStartWithDampPeerOscillations {})
+            (State::OpenSent(s), Event::ManualStart {}, _)
+            | (State::OpenSent(s), Event::AutomaticStart {}, _)
+            | (State::OpenSent(s), Event::ManualStartWithPassiveTcpEstablishment {}, _)
+            | (State::OpenSent(s), Event::AutomaticStartWithPassiveTcpEstablishment {}, _)
+            | (State::OpenSent(s), Event::AutomaticStartWithDampPeerOscillations {}, _)
             | (
                 State::OpenSent(s),
                 Event::AutomaticStartWithDampPeerOscillationsAndPassiveTcpEstablishment {},
+                _,
             ) => {
                 session = State::OpenSent(s);
             }
 
             //[Page 63]
-            (State::OpenSent(mut s), Event::ManualStop {}) => {
+            (State::OpenSent(mut s), Event::ManualStop {}, _) => {
                 let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
                 bgp_out_tx
                     .send(
@@ -768,7 +994,7 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 63]
-            (State::OpenSent(mut s), Event::AutomaticStop {}) => {
+            (State::OpenSent(mut s), Event::AutomaticStop {}, _) => {
                 let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
                 bgp_out_tx
                     .send(
@@ -800,7 +1026,7 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 64]
-            (State::OpenSent(mut s), Event::HoldTimerExpires {}) => {
+            (State::OpenSent(mut s), Event::HoldTimerExpires {}, _) => {
                 let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
                 bgp_out_tx
                     .send(
@@ -832,27 +1058,40 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 64]
-            (State::OpenSent(s), Event::TcpConnectionValid { conn: _ })
-            | (State::OpenSent(s), Event::TcpCRAcked { conn: _ })
-            | (State::OpenSent(s), Event::TcpConnectionConfirmed { conn: _ }) => {
-                // In our implementation, it is impossible to reach this state
-                // because new TCP connection originates from the peers are
-                // handled in other logic.
-
-                log::error!("OpenSent state reached with TCP connection event");
-
-                let fsm: Fsm<OpenSent> = s.into();
-                session = State::OpenSent(fsm);
+            (State::OpenSent(s), Event::TcpConnectionValid {}, _) => {
+                session = State::OpenSent(s);
             }
 
             //[Page 64]
-            (State::OpenSent(s), Event::TcpCRInvalid {}) => {
-                let fsm = s.into();
-                session = State::OpenSent(fsm);
+            (State::OpenSent(s), Event::TcpCRAcked { conn }, _) => {
+                let coll_tx = coll_tx.clone();
+                tokio::spawn(async move {
+                    let bgp_conn = BgpConn::new(conn);
+                    process_one(bgp_conn, coll_tx, false).await;
+                    //The bgp_conn will be returned in a custom event
+                });
+                session = State::OpenSent(s);
             }
 
             //[Page 64]
-            (State::OpenSent(s), Event::TcpConnectionFails {}) => {
+            (State::OpenSent(mut s), Event::TcpConnectionConfirmed { bgp_conn }, _) => {
+                s.state.collision_conn = Some(bgp_conn);
+                session = State::OpenSent(s);
+            }
+
+            // Custom Event:
+            (State::OpenSent(mut s), Event::ProcessOneDone { conn }, _) => {
+                s.state.collision_conn = Some(conn);
+                session = State::OpenSent(s);
+            }
+
+            //[Page 64]
+            (State::OpenSent(s), Event::TcpCRInvalid {}, _) => {
+                session = State::OpenSent(s);
+            }
+
+            //[Page 64]
+            (State::OpenSent(s), Event::TcpConnectionFails {}, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Restart,
@@ -866,7 +1105,47 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::Active(fsm);
             }
 
-            (State::OpenSent(mut s), Event::BGPOpen { msg }) => {
+            //[Page 65]
+            (State::OpenSent(mut s), Event::BGPOpen { msg, remote_syn }, _) => {
+                // Performing the collision detection
+                if s.state.remote_syn != remote_syn {
+                    if s.state.local_open.as_ref().unwrap().bgp_identifier < msg.bgp_identifier {
+                        // Replace current connection with the new colliding connection
+                        let bgp_tx = bgp_tx.clone();
+                        let (bgp_out_tx, bgp_out_rx) = mpsc::channel::<Message>(32);
+                        let bgp_conn = s.state.collision_conn.take().unwrap();
+                        let old_out_tx = s.state.bgp_out_tx.replace(bgp_out_tx.clone()).unwrap();
+                        old_out_tx
+                            .send(
+                                NotificationMsg::from_enum(
+                                    error::ErrorCode::Cease,
+                                    error::ErrorSubCode::Undefined,
+                                    None,
+                                )
+                                .into(),
+                            )
+                            .await
+                            .unwrap();
+
+                        //TODO: It might be possible that the handle is dropped before sending out the Cease message.
+                        let _ = s.state.bgp_conn_handle.replace(tokio::spawn(async move {
+                            process(bgp_conn, bgp_tx, bgp_out_rx, remote_syn).await;
+                        }));
+
+                        // Sync
+                        if remote_syn {
+                            let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                            bgp_out_tx
+                                .send(OpenMsg::from_conf(&conf).into())
+                                .await
+                                .unwrap();
+                        }
+                    } else {
+                        // Drop the colliding connection
+                        _ = s.state.collision_conn.take();
+                    }
+                }
+
                 timer_ctr_tx
                     .send(Timer::DelayOpen {
                         op: Operation::Stop,
@@ -935,19 +1214,385 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::OpenConfirm(fsm);
             }
 
+            //[Page 65]
+            (State::OpenSent(mut s), Event::BGPHeaderErr { err }, Source::Bgp)
+            | (State::OpenSent(mut s), Event::BGPOpenMsgErr { err }, Source::Bgp) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(NotificationMsg::from_error(err).into())
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 65]
+            // Ignore colliding connection's Error messages
+            (State::OpenSent(s), Event::BGPHeaderErr { err }, src)
+            | (State::OpenSent(s), Event::BGPOpenMsgErr { err }, src) => {
+                session = State::OpenSent(s);
+            }
+
+            //[Page 66]
+            (State::OpenSent(mut s), Event::NotifyMsgVerErr { err }, _) => {
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 66]
+            (State::OpenSent(mut s), _, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::FiniteStateMachineError,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            // OpenConfirm State:
+            //[Page 67]
+            // Ignore all start events (Events 1, 3-7)
+            (State::OpenConfirm(s), Event::ManualStart {}, _)
+            | (State::OpenConfirm(s), Event::AutomaticStart {}, _)
+            | (State::OpenConfirm(s), Event::ManualStartWithPassiveTcpEstablishment {}, _)
+            | (State::OpenConfirm(s), Event::AutomaticStartWithPassiveTcpEstablishment {}, _)
+            | (State::OpenConfirm(s), Event::AutomaticStartWithDampPeerOscillations {}, _)
+            | (
+                State::OpenConfirm(s),
+                Event::AutomaticStartWithDampPeerOscillationsAndPassiveTcpEstablishment {},
+                _,
+            ) => {
+                session = State::OpenConfirm(s);
+            }
+
+            //[Page 67]
+            (State::OpenConfirm(mut s), Event::ManualStop {}, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::Cease,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter = 0;
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 67]
+            (State::OpenConfirm(mut s), Event::AutomaticStop {}, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::Cease,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 67]
+            (State::OpenConfirm(mut s), Event::HoldTimerExpires {}, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::HoldTimerExpired,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 68]
+            (State::OpenConfirm(s), Event::KeepaliveTimerExpires {}, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx.send(KeepaliveMsg::new().into()).await.unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::Keepalive {
+                        op: Operation::Restart {},
+                    })
+                    .await
+                    .unwrap();
+
+                session = State::OpenConfirm(s);
+            }
+
+            //[Page 68]
+            (State::OpenConfirm(s), Event::TcpConnectionValid {}, _) => {
+                session = State::OpenConfirm(s);
+            }
+
+            //[Page 68]
+            (State::OpenConfirm(s), Event::TcpCRAcked { conn }, _) => {
+                let coll_tx = coll_tx.clone();
+                tokio::spawn(async move {
+                    let bgp_conn = BgpConn::new(conn);
+                    process_one(bgp_conn, coll_tx, false).await;
+                });
+
+                session = State::OpenConfirm(s);
+            }
+
+            //[Page 68]
+            (State::OpenConfirm(mut s), Event::TcpConnectionConfirmed { bgp_conn: conn }, _) => {
+                s.state.collision_conn = Some(conn);
+                session = State::OpenConfirm(s);
+            }
+
+            // Custom Event:
+            (State::OpenConfirm(mut s), Event::ProcessOneDone { conn }, _) => {
+                s.state.collision_conn = Some(conn);
+                session = State::OpenConfirm(s);
+            }
+
+            //[Page 68]
+            (State::OpenConfirm(s), Event::TcpCRInvalid {}, _) => {
+                // The local system will ignore the second connection attempt.
+
+                let fsm = s.into();
+                session = State::OpenConfirm(fsm);
+            }
+
+            //[Page 68]
+            (State::OpenConfirm(mut s), Event::TcpConnectionFails {}, _) => {
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+
+                s.attr.connect_retry_counter += 1;
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 69]
+            (State::OpenConfirm(mut s), Event::NotifyMsgVerErr { err }, _) => {
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 69]
+            (State::OpenConfirm(mut s), Event::BGPOpen { msg, remote_syn }, _) => {
+                // Performing the collision detection
+                if s.state.remote_syn == remote_syn {
+                    log::error!("Received OPEN message from the same direction");
+                    //TODO: Fix this with other unwraps
+                    panic!("Multiple OPEN messages received");
+                }
+
+                if s.state.local_open.as_ref().unwrap().bgp_identifier < msg.bgp_identifier {
+                    // Replace current connection with the new colliding connection
+                    let bgp_tx = bgp_tx.clone();
+                    let (bgp_out_tx, bgp_out_rx) = mpsc::channel::<Message>(32);
+                    let bgp_conn = s.state.collision_conn.take().unwrap();
+                    s.state.bgp_conn_handle.replace(tokio::spawn(async move {
+                        process(bgp_conn, bgp_tx, bgp_out_rx, remote_syn).await;
+                    }));
+                    s.state.bgp_out_tx.replace(bgp_out_tx.clone());
+                } else {
+                    // Drop the colliding connection
+                    _ = s.state.collision_conn.take();
+                }
+
+                session = State::OpenConfirm(s);
+            }
+
+            //[Page 69]
+            (State::OpenConfirm(mut s), Event::BGPHeaderErr { err }, Source::Bgp)
+            | (State::OpenConfirm(mut s), Event::BGPOpenMsgErr { err }, Source::Bgp) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(NotificationMsg::from_error(err).into())
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 69]
+            // Ignore colliding connection's Error messages
+            (State::OpenConfirm(s), Event::BGPHeaderErr { err }, src)
+            | (State::OpenConfirm(s), Event::BGPOpenMsgErr { err }, src) => {
+                session = State::OpenConfirm(s);
+            }
+
+            //[Page 70]
+            (State::OpenConfirm(s), Event::OpenCollisionDump {}, _) => {
+                // Not implemented
+                session = State::OpenConfirm(s);
+            }
+
             //TODO: Does every single move to Idle state have the timer reset?
-            (s, _) => session = s,
+            (s, _, _) => session = s,
         };
     }
 }
 
-// TODO: Redundant code
+async fn process_one(mut conn: BgpConn, bgp_tx: mpsc::Sender<Event>, remote_syn: bool) {
+    let msg = conn.read_message().await;
+    match msg {
+        Ok(msg) => match msg {
+            Message::Open(open) => {
+                bgp_tx.send(Event::ProcessOneDone { conn }).await.unwrap();
+                bgp_tx
+                    .send(Event::BGPOpen {
+                        msg: open,
+                        remote_syn,
+                    })
+                    .await
+                    .unwrap();
+            }
+            _ => (),
+        },
+        Err(e) => {
+            match e.code {
+                error::ErrorCode::MessageHeaderError => {
+                    bgp_tx.send(Event::BGPHeaderErr { err: e }).await.unwrap();
+                }
+                error::ErrorCode::OpenMessageError => {
+                    bgp_tx.send(Event::BGPOpenMsgErr { err: e }).await.unwrap();
+                }
+                //TODO: Add more error handling
+                _ => (),
+            }
+        }
+    }
+}
+
 async fn process(
-    socket: TcpStream,
+    mut conn: BgpConn,
     bgp_tx: mpsc::Sender<Event>,
     mut bgp_out_rx: mpsc::Receiver<Message>,
+    remote_syn: bool,
 ) {
-    let mut conn = BgpConn::new(socket);
     loop {
         select! {
             msg = bgp_out_rx.recv() => {
@@ -964,7 +1609,7 @@ async fn process(
                         println!("Received message: {:?}", msg);
                         match msg {
                             Message::Open(open) => {
-                                bgp_tx.send(Event::BGPOpen { msg: open }).await.unwrap();
+                                bgp_tx.send(Event::BGPOpen { msg: open , remote_syn}).await.unwrap();
                             }
                             _ => (),
                         }
@@ -976,14 +1621,8 @@ async fn process(
                                 bgp_tx.send(Event::BGPHeaderErr { err: e }).await.unwrap();
                             }
                             error::ErrorCode::OpenMessageError => {
-                                match e.subcode {
-                                    error::ErrorSubCode::OpenMsgErrorSubcode(error::OpenMsgErrorSubcode::UnsupportedVersionNumber) => {
-                                        bgp_tx.send(Event::NotifyMsgVerErr { err: e }).await.unwrap();
-                                    }
-                                    _ => {
-                                        bgp_tx.send(Event::BGPOpenMsgErr { err: e }).await.unwrap();
-                                    }
-                                }                            },
+                                bgp_tx.send(Event::BGPOpenMsgErr { err: e }).await.unwrap();
+                            }
                             //TODO: Add more error handling
                             _ => break,
                         }

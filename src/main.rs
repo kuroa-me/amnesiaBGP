@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 mod config;
 mod connection;
@@ -24,34 +24,47 @@ async fn main() {
     //     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
     //     179,
     // )];
-    let mut sessions: HashMap<IpAddr, mpsc::Sender<Event>> = HashMap::new();
+    let mut sessions: HashMap<(IpAddr, u32), mpsc::Sender<Event>> = HashMap::new();
 
     for (addr, neigh) in conf.neighbors.clone().into_iter() {
         let (admin_tx, admin_rx) = mpsc::channel::<Event>(32);
         // let (conn_tx, conn_rx) = oneshot::channel::<TcpStream>();
-        sessions.insert(addr.clone(), admin_tx);
+        sessions.insert((addr.clone(), neigh.config.peer_as), admin_tx);
         // let admin_rx = admin_tx.subscribe();
         tokio::spawn(async move {
             session::run(
-                State::new(SocketAddr::new(
-                    addr.clone(),
-                    neigh.config.neighbor_port.clone(),
-                )),
+                State::new(SocketAddr::new(addr, neigh.config.neighbor_port)),
                 admin_rx,
                 neigh,
             )
         });
     }
 
+    //TODO: This listener probably will have to cover multiple instances of the BGP router
     let listener = TcpListener::bind("127.0.0.1:179").await.unwrap();
-    let (open_tx, mut open_rx) = mpsc::channel::<(SocketAddr, message::OpenMsg)>(32);
+    let (open_tx, mut open_rx) = mpsc::channel::<(BgpConn, message::OpenMsg)>(32);
     tokio::spawn(async move {
         loop {
-            let (sock, open) = open_rx.recv().await.unwrap();
-            let session = sessions.get(&sock.ip()).unwrap();
-            //Fixme: This is a hack, we should send the message to the bgp channel
-            // instead of the admin channel.
-            session.send(Event::BGPOpen { msg: open }).await.unwrap();
+            let (conn, open) = open_rx.recv().await.unwrap();
+            let session = sessions
+                .get(&(conn.peer_sock().unwrap().ip(), open.as_number))
+                .unwrap();
+
+            //? This is a hack to make the state machine behave. In order for
+            //? our implementation to handle multiple remote peers and dynamic
+            //? AS numbers, we have to read the AS number from the Open message.
+            //? Thus, skipping a few steps in the FSM.
+            session
+                .send(Event::TcpConnectionConfirmed { bgp_conn: conn })
+                .await
+                .unwrap();
+            session
+                .send(Event::BGPOpen {
+                    msg: open,
+                    remote_syn: true,
+                })
+                .await
+                .unwrap();
         }
     });
     loop {
@@ -63,28 +76,29 @@ async fn main() {
     }
 }
 
-// TODO: Redundant code
-async fn process_passive(socket: TcpStream, bgp_tx: mpsc::Sender<(SocketAddr, message::OpenMsg)>) {
+async fn process_passive(socket: TcpStream, bgp_tx: mpsc::Sender<(BgpConn, message::OpenMsg)>) {
     let mut conn = BgpConn::new(socket);
-    loop {
-        match conn.read_message().await {
-            Ok(msg) => {
-                println!("Received message: {:?}", msg);
-                match msg {
-                    message::Message::Open(open) => {
-                        let sock = conn.peer_sock().unwrap();
-                        bgp_tx.send((sock, open)).await.unwrap();
-                    }
-                    _ => {
-                        println!("Not an Open message");
-                        break;
-                    }
+    let recv_msg: message::OpenMsg;
+    match conn.read_message().await {
+        //TODO: Timeout
+        Ok(msg) => {
+            println!("Received message: {:?}", msg);
+            match msg {
+                message::Message::Open(open) => {
+                    // let sock = conn.peer_sock().unwrap();
+                    // bgp_tx.send((sock, open)).await.unwrap();
+                    recv_msg = open;
+                }
+                _ => {
+                    println!("Not an Open message");
+                    return;
                 }
             }
-            Err(e) => {
-                println!("Error: {:?}", e);
-                break;
-            }
+        }
+        Err(e) => {
+            println!("Error: {:?}", e);
+            return;
         }
     }
+    bgp_tx.send((conn, recv_msg)).await.unwrap();
 }

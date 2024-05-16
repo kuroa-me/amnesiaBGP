@@ -33,21 +33,24 @@ pub enum Event {
     KeepaliveTimerExpires {},
     DelayOpenTimerExpires {},
     IdleHoldTimerExpires {},
-    TcpConnectionValid { conn: TcpStream },
+    TcpConnectionValid {},
     TcpCRInvalid {},
     TcpCRAcked { conn: TcpStream },
-    TcpConnectionConfirmed { conn: TcpStream },
+    TcpConnectionConfirmed { bgp_conn: BgpConn },
     TcpConnectionFails {},
-    BGPOpen { msg: OpenMsg },
-    BGPOpenWithDelayOpenTimerRunning { msg: OpenMsg },
+    BGPOpen { msg: OpenMsg, remote_syn: bool },
+    BGPOpenWithDelayOpenTimerRunning { msg: OpenMsg, remote_syn: bool },
     BGPHeaderErr { err: Error },
     BGPOpenMsgErr { err: Error },
-    BGPOpenCollisionDump {},
+    OpenCollisionDump {},
     NotifyMsgVerErr { err: Error },
     NotifyMsgErr {},
     KeepaliveMsg {},
     UpdateMsg {},
     UpdateMsgErr {},
+
+    // Custom Events
+    ProcessOneDone { conn: BgpConn },
 }
 
 pub struct SessionAttributes {
@@ -112,6 +115,8 @@ pub struct OpenSent {
     pub bgp_conn_handle: Option<task::JoinHandle<()>>,
     pub bgp_out_tx: Option<mpsc::Sender<Message>>,
     pub local_open: Option<OpenMsg>,
+    pub remote_syn: bool,
+    pub collision_conn: Option<BgpConn>,
 }
 
 pub struct OpenConfirm {
@@ -119,6 +124,8 @@ pub struct OpenConfirm {
     pub bgp_out_tx: Option<mpsc::Sender<Message>>,
     pub peer_open: Option<OpenMsg>,
     pub local_open: Option<OpenMsg>,
+    pub remote_syn: bool,
+    pub collision_conn: Option<BgpConn>,
 }
 
 pub struct Established {}
@@ -202,6 +209,8 @@ impl From<Fsm<Connect>> for Fsm<OpenSent> {
                 bgp_conn_handle: None,
                 bgp_out_tx: None,
                 local_open: None,
+                remote_syn: false,
+                collision_conn: None,
             },
             peer: fsm.peer,
             attr: fsm.attr,
@@ -217,6 +226,8 @@ impl From<Fsm<Connect>> for Fsm<OpenConfirm> {
                 bgp_out_tx: fsm.state.bgp_out_tx,
                 peer_open: None,
                 local_open: None,
+                remote_syn: false,
+                collision_conn: None,
             },
             peer: fsm.peer,
             attr: fsm.attr,
@@ -258,6 +269,8 @@ impl From<Fsm<Active>> for Fsm<OpenSent> {
                 bgp_conn_handle: fsm.state.bgp_conn_handle,
                 bgp_out_tx: fsm.state.bgp_out_tx,
                 local_open: None,
+                remote_syn: true,
+                collision_conn: None,
             },
             peer: fsm.peer,
             attr: fsm.attr,
@@ -273,6 +286,8 @@ impl From<Fsm<Active>> for Fsm<OpenConfirm> {
                 bgp_out_tx: fsm.state.bgp_out_tx,
                 peer_open: None,
                 local_open: None,
+                remote_syn: true,
+                collision_conn: None,
             },
             peer: fsm.peer,
             attr: fsm.attr,
@@ -318,7 +333,22 @@ impl From<Fsm<OpenSent>> for Fsm<OpenConfirm> {
                 bgp_out_tx: fsm.state.bgp_out_tx,
                 peer_open: None,
                 local_open: fsm.state.local_open,
+                remote_syn: fsm.state.remote_syn,
+                collision_conn: fsm.state.collision_conn,
             },
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<OpenConfirm>> for Fsm<Idle> {
+    fn from(fsm: Fsm<OpenConfirm>) -> Fsm<Idle> {
+        if let Some(bgp_conn_handle) = fsm.state.bgp_conn_handle {
+            bgp_conn_handle.abort();
+        }
+        Fsm {
+            state: Idle {},
             peer: fsm.peer,
             attr: fsm.attr,
         }
@@ -337,6 +367,17 @@ pub enum State {
 impl State {
     pub fn new(peer: SocketAddr) -> State {
         State::Idle(Fsm::new(peer))
+    }
+
+    pub fn get_attr(&self) -> &SessionAttributes {
+        match self {
+            State::Idle(fsm) => &fsm.attr,
+            State::Connect(fsm) => &fsm.attr,
+            State::Active(fsm) => &fsm.attr,
+            State::OpenSent(fsm) => &fsm.attr,
+            State::OpenConfirm(fsm) => &fsm.attr,
+            State::Established(fsm) => &fsm.attr,
+        }
     }
 }
 
