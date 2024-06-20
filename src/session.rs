@@ -83,8 +83,11 @@ pub async fn try_tcp_conn(tcp_tx: mpsc::Sender<Event>, peer: SocketAddr) {
             tcp_tx.send(Event::TcpCRAcked { conn }).await.unwrap();
         }
         //TODO: Add error handling
-        Err(_) => {
-            tcp_tx.send(Event::TcpConnectionFails {}).await.unwrap();
+        Err(e) => {
+            tcp_tx
+                .send(Event::TcpConnectionFails { err: e.into() })
+                .await
+                .unwrap();
         }
     }
 }
@@ -341,7 +344,7 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 56]
-            (State::Connect(mut s), Event::TcpConnectionFails {}, _) => {
+            (State::Connect(mut s), Event::TcpConnectionFails { err: _ }, _) => {
                 match s.attr.cur_delay_open_time {
                     FAR_FUTURE => {
                         timer_ctr_tx
@@ -759,7 +762,7 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 60]
-            (State::Active(mut s), Event::TcpConnectionFails {}, _) => {
+            (State::Active(mut s), Event::TcpConnectionFails { err: _ }, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Restart,
@@ -1091,7 +1094,7 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 64]
-            (State::OpenSent(s), Event::TcpConnectionFails {}, _) => {
+            (State::OpenSent(s), Event::TcpConnectionFails { err: _ }, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Restart,
@@ -1452,7 +1455,7 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
             }
 
             //[Page 68]
-            (State::OpenConfirm(mut s), Event::TcpConnectionFails {}, _) => {
+            (State::OpenConfirm(mut s), Event::TcpConnectionFails { err: _ }, _) => {
                 timer_ctr_tx
                     .send(Timer::ConnectRetry {
                         op: Operation::Stop,
@@ -1550,6 +1553,365 @@ pub async fn run(mut session: State, mut admin_rx: mpsc::Receiver<Event>, conf: 
                 session = State::OpenConfirm(s);
             }
 
+            //[Page 70]
+            (State::OpenConfirm(mut s), Event::KeepaliveMsg {}, _) => {
+                timer_ctr_tx
+                    .send(Timer::Hold {
+                        op: Operation::Restart,
+                    })
+                    .await
+                    .unwrap();
+
+                let fsm: Fsm<Established> = s.into();
+                session = State::Established(fsm);
+            }
+
+            //[Page 70]
+            (State::OpenConfirm(mut s), _, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::FiniteStateMachineError,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            // Established State:
+            //[Page 71]
+            // Ignore all start events (Events 1, 3-7)
+            (State::Established(s), Event::ManualStart {}, _)
+            | (State::Established(s), Event::AutomaticStart {}, _)
+            | (State::Established(s), Event::ManualStartWithPassiveTcpEstablishment {}, _)
+            | (State::Established(s), Event::AutomaticStartWithPassiveTcpEstablishment {}, _)
+            | (State::Established(s), Event::AutomaticStartWithDampPeerOscillations {}, _)
+            | (
+                State::Established(s),
+                Event::AutomaticStartWithDampPeerOscillationsAndPassiveTcpEstablishment {},
+                _,
+            ) => {
+                session = State::Established(s);
+            }
+
+            //[Page 71]
+            (State::Established(mut s), Event::ManualStop {}, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::Cease,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter = 0;
+
+                //TODO: Delete all routes associated with this connection,
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 71]
+            (State::Established(mut s), Event::AutomaticStop {}, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::Cease,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                //TODO: Deletes all routes associated with this connection
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 72]
+            (State::Established(mut s), Event::HoldTimerExpires {}, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::HoldTimerExpired,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 72]
+            (State::Established(mut s), Event::KeepaliveTimerExpires {}, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx.send(KeepaliveMsg::new().into()).await.unwrap();
+
+                // restarts its KeepaliveTimer, unless the negotiated HoldTime value is zero.
+                if s.attr.hold_time != FAR_FUTURE {
+                    timer_ctr_tx
+                        .send(Timer::Keepalive {
+                            op: Operation::Restart,
+                        })
+                        .await
+                        .unwrap();
+                }
+
+                session = State::Established(s);
+            }
+
+            //[Page 72]
+            (State::Established(s), Event::TcpConnectionValid {}, _) => {
+                //Not implemented
+                session = State::Established(s);
+            }
+
+            //[Page 72]
+            (State::Established(s), Event::TcpCRInvalid {}, _) => {
+                //Ignored
+                session = State::Established(s);
+            }
+
+            //[Page 72]
+            (State::Established(s), Event::TcpCRAcked { conn }, _) => {
+                let coll_tx = coll_tx.clone();
+                tokio::spawn(async move {
+                    let bgp_conn = BgpConn::new(conn);
+                    process_one(bgp_conn, coll_tx, false).await;
+                });
+
+                session = State::Established(s);
+            }
+
+            //[Page 72]
+            (State::Established(mut s), Event::TcpConnectionConfirmed { bgp_conn: conn }, _) => {
+                s.state.collision_conn = Some(conn);
+                session = State::Established(s);
+            }
+
+            // Custom Event:
+            (State::Established(mut s), Event::ProcessOneDone { conn }, _) => {
+                s.state.collision_conn = Some(conn);
+                session = State::Established(s);
+            }
+
+            //[Page 73]
+            (State::Established(mut s), Event::BGPOpen { msg, remote_syn }, _) => {
+                // Performing the collision detection
+                if s.state.remote_syn == remote_syn {
+                    log::error!("Received OPEN message from the same direction");
+                    //TODO: Fix this with other unwraps
+                    panic!("Multiple OPEN messages received");
+                }
+
+                if s.attr.collision_detect_established_state
+                    && s.state.local_open.as_ref().unwrap().bgp_identifier < msg.bgp_identifier
+                {
+                    // Replace current connection with the new colliding connection
+                    let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                    bgp_out_tx
+                        .send(
+                            NotificationMsg::from_enum(
+                                error::ErrorCode::Cease,
+                                error::ErrorSubCode::Undefined,
+                                None,
+                            )
+                            .into(),
+                        )
+                        .await
+                        .unwrap();
+                    //TODO: Delete all routes associated with this connection
+
+                    let bgp_tx = bgp_tx.clone();
+                    let (bgp_out_tx, bgp_out_rx) = mpsc::channel::<Message>(32);
+                    let bgp_conn = s.state.collision_conn.take().unwrap();
+                    s.state.bgp_conn_handle.replace(tokio::spawn(async move {
+                        process(bgp_conn, bgp_tx, bgp_out_rx, remote_syn).await;
+                    }));
+                    s.state.bgp_out_tx.replace(bgp_out_tx.clone());
+                } else {
+                    // Drop the colliding connection
+                    _ = s.state.collision_conn.take();
+                }
+
+                session = State::Established(s);
+            }
+
+            //[Page 73]
+            (State::Established(mut s), Event::NotifyMsgVerErr { err }, _)
+            | (State::Established(mut s), Event::NotifyMsg { err }, _)
+            | (State::Established(mut s), Event::TcpConnectionFails { err }, _) => {
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                //TODO: Delete all routes associated with this connection
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 74]
+            (State::Established(mut s), Event::KeepaliveMsg {}, _) => {
+                timer_ctr_tx
+                    .send(Timer::Hold {
+                        op: Operation::Restart,
+                    })
+                    .await
+                    .unwrap();
+                session = State::Established(s);
+            }
+
+            //[Page 74]
+            (State::Established(mut s), Event::UpdateMsg { msg }, _) => {
+                //TODO: Process the Update message
+
+                timer_ctr_tx
+                    .send(Timer::Hold {
+                        op: Operation::Restart,
+                    })
+                    .await
+                    .unwrap();
+                session = State::Established(s);
+            }
+
+            //[Page 74]
+            (State::Established(mut s), Event::UpdateMsgErr { err }, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(NotificationMsg::from_error(err).into())
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(
+                        Timer::ConnectRetry {
+                            op: Operation::Stop,
+                        }
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                //TODO: Delete all routes associated with this connection
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
+            //[Page 74]
+            (State::Established(mut s), _, _) => {
+                let bgp_out_tx = s.state.bgp_out_tx.as_ref().unwrap();
+                bgp_out_tx
+                    .send(
+                        NotificationMsg::from_enum(
+                            error::ErrorCode::FiniteStateMachineError,
+                            error::ErrorSubCode::Undefined,
+                            None,
+                        )
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                timer_ctr_tx
+                    .send(Timer::ConnectRetry {
+                        op: Operation::Stop,
+                    })
+                    .await
+                    .unwrap();
+                s.attr.cur_connect_retry_time = FAR_FUTURE;
+                s.attr.connect_retry_counter += 1;
+
+                //TODO: Delete all routes associated with this connection
+
+                if s.attr.damp_peer_oscillations {
+                    //TODO: Perform peer oscillation damping
+                }
+
+                let fsm: Fsm<Idle> = s.into();
+                session = State::Idle(fsm);
+            }
+
             //TODO: Does every single move to Idle state have the timer reset?
             (s, _, _) => session = s,
         };
@@ -1610,7 +1972,10 @@ async fn process(
                         match msg {
                             Message::Open(open) => {
                                 bgp_tx.send(Event::BGPOpen { msg: open , remote_syn}).await.unwrap();
-                            }
+                            },
+                            Message::Update(update) => {
+                                bgp_tx.send(Event::UpdateMsg { msg: update }).await.unwrap();
+                            },
                             _ => (),
                         }
                     }

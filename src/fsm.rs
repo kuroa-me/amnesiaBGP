@@ -37,17 +37,17 @@ pub enum Event {
     TcpCRInvalid {},
     TcpCRAcked { conn: TcpStream },
     TcpConnectionConfirmed { bgp_conn: BgpConn },
-    TcpConnectionFails {},
+    TcpConnectionFails { err: Error },
     BGPOpen { msg: OpenMsg, remote_syn: bool },
     BGPOpenWithDelayOpenTimerRunning { msg: OpenMsg, remote_syn: bool },
     BGPHeaderErr { err: Error },
     BGPOpenMsgErr { err: Error },
     OpenCollisionDump {},
     NotifyMsgVerErr { err: Error },
-    NotifyMsgErr {},
+    NotifyMsg { err: Error },
     KeepaliveMsg {},
-    UpdateMsg {},
-    UpdateMsgErr {},
+    UpdateMsg { msg: UpdateMsg },
+    UpdateMsgErr { err: Error },
 
     // Custom Events
     ProcessOneDone { conn: BgpConn },
@@ -61,6 +61,7 @@ pub struct SessionAttributes {
     pub delay_open_time: Duration,
     pub delay_open: bool,
     pub send_notification_without_open: bool,
+    pub collision_detect_established_state: bool,
     pub damp_peer_oscillations: bool,
 
     //TODO: Current timer_loop implementation does not support querying the timer for remaining time.
@@ -80,6 +81,7 @@ impl SessionAttributes {
             delay_open_time: Duration::ZERO,
             delay_open: false,
             send_notification_without_open: false,
+            collision_detect_established_state: false,
             damp_peer_oscillations: false,
 
             cur_connect_retry_time: FAR_FUTURE,
@@ -128,7 +130,14 @@ pub struct OpenConfirm {
     pub collision_conn: Option<BgpConn>,
 }
 
-pub struct Established {}
+pub struct Established {
+    pub bgp_conn_handle: Option<task::JoinHandle<()>>,
+    pub bgp_out_tx: Option<mpsc::Sender<Message>>,
+    pub peer_open: Option<OpenMsg>,
+    pub local_open: Option<OpenMsg>,
+    pub remote_syn: bool,
+    pub collision_conn: Option<BgpConn>,
+}
 
 impl Fsm<Idle> {
     pub fn new(peer: SocketAddr) -> Fsm<Idle> {
@@ -344,6 +353,36 @@ impl From<Fsm<OpenSent>> for Fsm<OpenConfirm> {
 
 impl From<Fsm<OpenConfirm>> for Fsm<Idle> {
     fn from(fsm: Fsm<OpenConfirm>) -> Fsm<Idle> {
+        if let Some(bgp_conn_handle) = fsm.state.bgp_conn_handle {
+            bgp_conn_handle.abort();
+        }
+        Fsm {
+            state: Idle {},
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<OpenConfirm>> for Fsm<Established> {
+    fn from(fsm: Fsm<OpenConfirm>) -> Fsm<Established> {
+        Fsm {
+            state: Established {
+                bgp_conn_handle: fsm.state.bgp_conn_handle,
+                bgp_out_tx: fsm.state.bgp_out_tx,
+                peer_open: fsm.state.peer_open,
+                local_open: fsm.state.local_open,
+                remote_syn: fsm.state.remote_syn,
+                collision_conn: fsm.state.collision_conn,
+            },
+            peer: fsm.peer,
+            attr: fsm.attr,
+        }
+    }
+}
+
+impl From<Fsm<Established>> for Fsm<Idle> {
+    fn from(fsm: Fsm<Established>) -> Fsm<Idle> {
         if let Some(bgp_conn_handle) = fsm.state.bgp_conn_handle {
             bgp_conn_handle.abort();
         }
